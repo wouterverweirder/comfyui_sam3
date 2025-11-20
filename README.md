@@ -17,7 +17,7 @@ SAM3 is a powerful zero-shot segmentation model that can identify and segment ob
 
 ## Quickstart
 1. Clone this repository under `ComfyUI/custom_nodes`.
-2. Install SAM3 dependencies (if not already installed):
+2. Install the dependencies:
    ```bash
    pip install -r requirements.txt
    ```
