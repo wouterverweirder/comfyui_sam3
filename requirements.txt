@@ -1,3 +1,11 @@
 decord>=0.6.0
 pycocotools>=2.0.10
-git+https://github.com/facebookresearch/sam3.git
+numpy>=1.26
+git+https://github.com/facebookresearch/sam3.git --no-deps
+timm>=1.0.17
+tqdm
+ftfy==6.1.1
+regex
+iopath>=0.1.10
+typing_extensions
+huggingface_hub
