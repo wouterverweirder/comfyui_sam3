@@ -39,7 +39,6 @@ from sam3.model.text_encoder_ve import VETextEncoder
 from sam3.model.tokenizer_ve import SimpleTokenizer
 from sam3.model.vitdet import ViT
 from sam3.model.vl_combiner import SAM3VLBackbone
-from sam3.sam.transformer import RoPEAttention
 
 
 # Setup TensorFloat-32 for Ampere GPUs if available
@@ -365,6 +364,9 @@ def _create_tracker_maskmem_backbone():
 
 def _create_tracker_transformer():
     """Create the SAM3 Tracker transformer components."""
+    # Import RoPEAttention locally to avoid top-level import issues
+    from sam3.sam.transformer import RoPEAttention
+    
     # Self attention
     self_attention = RoPEAttention(
         embedding_dim=256,
