@@ -8,4 +8,5 @@ regex
 iopath>=0.1.10
 typing_extensions
 huggingface_hub
-triton
+triton-windows; sys_platform == 'win32'
+triton; sys_platform != 'win32'
