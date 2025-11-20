@@ -13,6 +13,8 @@ SAM3 is a powerful zero-shot segmentation model that can identify and segment ob
 - Generate a combined mask of all detections
 - Visualize results with colored overlays, bounding boxes, and confidence scores
 
+![SAM3 Segmentation Example](screenshot.jpg)
+
 ## Quickstart
 
 1. Install [ComfyUI](https://docs.comfy.org/get_started).
