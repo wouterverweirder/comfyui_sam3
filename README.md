@@ -16,19 +16,23 @@ SAM3 is a powerful zero-shot segmentation model that can identify and segment ob
 ![SAM3 Segmentation Example](screenshot.jpg)
 
 ## Quickstart
+
 1. Clone this repository under `ComfyUI/custom_nodes`.
 2. Install the dependencies:
    ```bash
    pip install -r requirements.txt
    ```
 3. Request model access at https://huggingface.co/facebook/sam3
-4. Restart ComfyUI.
+4. Login to huggingface using ``hf auth login``
+5. Restart ComfyUI.
+6. Load example workflow from ``workflow_example/Workflow_SAM3_image_text.json``
 
 ## Features
 
 ### SAM3 Segmentation Node
 
 **Inputs:**
+
 - **image** - Input image to segment
 - **prompt** (STRING) - Text description of objects to segment (e.g., "person", "car", "building")
 - **threshold** (FLOAT, 0.0-1.0) - Minimum confidence score threshold for detections (default: 0.5)
@@ -36,11 +40,13 @@ SAM3 is a powerful zero-shot segmentation model that can identify and segment ob
 - **min_height_pixels** (INT) - Minimum bounding box height in pixels (default: 0)
 
 **Outputs:**
+
 - **segmented_image** (IMAGE) - Visualization with colored mask overlays, bounding boxes, and confidence scores
 - **masks** (MASK) - Batch of individual binary masks, one for each detected object `[B, H, W]`
 - **mask_combined** (MASK) - Single merged mask containing all detected objects `[1, H, W]`
 
 **Example Use Cases:**
+
 - Remove backgrounds by segmenting people or objects
 - Isolate specific elements in a scene for further processing
 - Create masks for inpainting workflows
