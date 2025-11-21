@@ -4,3 +4,4 @@ recursive-include examples *.py
 recursive-include examples *.ipynb
 recursive-include examples *.md
 recursive-include tests *.py
+recursive-include sam3/assets *
