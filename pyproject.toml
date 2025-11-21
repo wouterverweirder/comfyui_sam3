@@ -47,7 +47,7 @@ Documentation = "https://github.com/wouterverweirder/comfyui_sam3/wiki"
 
 
 [tool.comfy]
-PublisherId = "wouterverweirder"
+PublisherId = "wouter"
 DisplayName = "ComfyUI SAM3"
 Icon = ""
 Tags = []
