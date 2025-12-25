@@ -392,8 +392,23 @@ class SAM3Segmentation:
         return (result_tensor, masks_tensor, combined_mask_tensor, segs)
     
     def _segment_with_video_model(self, image, prompt, threshold, min_width_pixels, min_height_pixels, object_ids=""):
-        """Process images as video frames using the video model with temporal tracking"""
-        # Parse object IDs if provided
+        """Process images as video frames using the video model with temporal tracking.
+
+        Uses mega-batch processing to minimize RAM usage:
+        1. Process video in chunks of MEGA_BATCH_SIZE frames (~200)
+        2. Each chunk is initialized separately with SAM3 (loads only chunk frames to RAM)
+        3. First chunk uses text prompt, subsequent chunks use box prompts from last frame
+        4. This reduces peak RAM from O(total_frames) to O(MEGA_BATCH_SIZE)
+        """
+        import gc
+        import tempfile
+        import os
+        import shutil
+        from PIL import ImageDraw, ImageFont
+
+        MEGA_BATCH_SIZE = 200
+        FRAME_BATCH_SIZE = 32
+
         track_object_ids = None
         if object_ids and object_ids.strip():
             try:
@@ -402,240 +417,225 @@ class SAM3Segmentation:
             except ValueError:
                 print(f"SAM3 Video: Warning - Invalid object_ids format '{object_ids}', tracking all objects")
                 track_object_ids = None
-        import tempfile
-        import os
-        import shutil
-        
-        batch_size = image.shape[0]
-        
-        # Get image dimensions for SEGS shape
+
+        total_frames = image.shape[0]
         img_height = image.shape[1]
         img_width = image.shape[2]
-        
-        # Convert batch of images to list of PIL images for video processing
-        pil_images = []
-        image_nps = []  # Keep numpy arrays for SEG cropping
-        for batch_idx in range(batch_size):
-            image_np = (image[batch_idx].cpu().numpy() * 255).astype(np.uint8)
-            image_nps.append(image_np)
-            pil_image = Image.fromarray(image_np)
-            pil_images.append(pil_image)
-        
-        # Use a persistent temp directory that we clean manually
-        temp_dir = tempfile.mkdtemp()
+
+        all_result_images = torch.zeros(total_frames, img_height, img_width, 3, dtype=torch.float32)
+        all_combined_masks = torch.zeros(total_frames, img_height, img_width, dtype=torch.float32)
+        all_masks_list = []
+        all_segs = []
+
+        colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255)]
+
         try:
-            
-            # Save images to temporary directory for video model
-            for idx, pil_img in enumerate(pil_images):
-                pil_img.save(os.path.join(temp_dir, f"frame_{idx:05d}.jpg"))
-            
-            # Initialize inference state with video frames
-            inference_state = self.model.init_state(resource_path=temp_dir)
-            
-            # Add text prompt on the first frame
-            frame_idx, initial_output = self.model.add_prompt(
-                inference_state=inference_state,
-                frame_idx=0,
-                text_str=prompt
-            )
-            
-            print(f"SAM3 Video: Initial detection on frame 0 with prompt '{prompt}'")
-            
-            # Propagate across all frames to track objects
-            video_segments = {}
-            for frame_idx, outputs in self.model.propagate_in_video(
-                inference_state=inference_state,
-                start_frame_idx=0,
-                max_frame_num_to_track=batch_size,
-                reverse=False
-            ):
-                video_segments[frame_idx] = outputs
-            
-            # Process results for each frame
-            all_result_images = []
-            all_masks = []
-            all_combined_masks = []
-            all_segs = []  # List to collect all SEG objects
-            
-            for batch_idx in range(batch_size):
-                pil_image = pil_images[batch_idx]
-                
-                if batch_idx not in video_segments:
-                    # No detections for this frame
-                    print(f"SAM3 Video [Frame {batch_idx + 1}/{batch_size}] no objects detected")
-                    result_np = np.array(pil_image).astype(np.float32) / 255.0
-                    all_result_images.append(result_np)
-                    all_combined_masks.append(np.zeros((pil_image.size[1], pil_image.size[0]), dtype=np.float32))
-                    continue
-                
-                outputs = video_segments[batch_idx]
-                out_obj_ids = outputs['out_obj_ids']
-                out_binary_masks = outputs['out_binary_masks']
-                out_probs = outputs['out_probs']
-                out_boxes_xywh = outputs['out_boxes_xywh']
-                
-                # Filter by threshold, size, and object IDs
-                filtered_indices = []
-                for i, (obj_id, prob, box_xywh) in enumerate(zip(out_obj_ids, out_probs, out_boxes_xywh)):
-                    # Filter by object ID if specified
-                    if track_object_ids is not None and obj_id not in track_object_ids:
-                        continue
-                    
-                    if prob >= threshold:
-                        # box_xywh is in [x, y, w, h] format
-                        box_width = box_xywh[2]
-                        box_height = box_xywh[3]
-                        if box_width >= min_width_pixels and box_height >= min_height_pixels:
-                            filtered_indices.append(i)
-                
-                filtered_obj_ids = [out_obj_ids[i] for i in filtered_indices]
-                filtered_masks = [out_binary_masks[i] for i in filtered_indices]
-                filtered_probs = [out_probs[i] for i in filtered_indices]
-                filtered_boxes = [out_boxes_xywh[i] for i in filtered_indices]
-                
-                print(f"SAM3 Video [Frame {batch_idx + 1}/{batch_size}] tracking {len(filtered_obj_ids)} object(s) with IDs {filtered_obj_ids}")
-                
-                # Create visualization
-                result_img = pil_image.copy()
-                
-                # Convert to RGB for drawing
-                result_img_rgb = result_img.convert('RGB')
-                
-                from PIL import ImageDraw, ImageFont
-                
-                for i, (obj_id, mask, prob, box_xywh) in enumerate(zip(filtered_obj_ids, filtered_masks, filtered_probs, filtered_boxes)):
-                    # mask is already in video resolution and binary
-                    mask = mask.astype(bool)
-                    
-                    # Create colored overlay
-                    mask_array = np.zeros((pil_image.size[1], pil_image.size[0], 4), dtype=np.uint8)
-                    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255)]
-                    mask_color = colors[obj_id % len(colors)]
-                    mask_array[mask] = (*mask_color, 100)
-                    
-                    mask_overlay = Image.fromarray(mask_array, 'RGBA')
-                    result_img_rgb = Image.alpha_composite(result_img_rgb.convert('RGBA'), mask_overlay).convert('RGB')
-                
-                # Draw bounding boxes and labels on the result image
-                draw = ImageDraw.Draw(result_img_rgb)
-                try:
-                    font = ImageFont.truetype("arial.ttf", 24)
-                except:
-                    font = ImageFont.load_default()
-                
-                for i, (obj_id, mask, prob, box_xywh) in enumerate(zip(filtered_obj_ids, filtered_masks, filtered_probs, filtered_boxes)):
-                    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255)]
-                    mask_color = colors[obj_id % len(colors)]
-                    
-                    # box_xywh is in relative coordinates [x, y, w, h] - convert to pixels
-                    img_w, img_h = pil_image.size
-                    x, y, w, h = box_xywh
-                    x1 = int(x * img_w)
-                    y1 = int(y * img_h)
-                    x2 = int((x + w) * img_w)
-                    y2 = int((y + h) * img_h)
-                    
-                    # Draw bounding box with thick line
-                    draw.rectangle([x1, y1, x2, y2], outline=mask_color, width=5)
-                    
-                    # Draw object ID and score label
-                    label_text = f"ID:{obj_id} {prob:.2f}"
-                    
-                    # Position text above the box
-                    text_y = max(y1 - 35, 5)
-                    text_bbox = draw.textbbox((x1, text_y), label_text, font=font)
-                    # Draw background rectangle for text
-                    draw.rectangle(text_bbox, fill=mask_color)
-                    draw.text((x1, text_y), label_text, fill=(255, 255, 255), font=font)
-                
-                result_img = result_img_rgb
-                
-                # Convert result back to ComfyUI format
-                result_np = np.array(result_img).astype(np.float32) / 255.0
-                all_result_images.append(result_np)
-                
-                # Prepare masks and SEG objects
-                mask_list = []
-                image_np = image_nps[batch_idx]
-                img_w, img_h = pil_image.size  # PIL size is (width, height)
-                
-                for i, (obj_id, mask, prob, box_xywh) in enumerate(zip(filtered_obj_ids, filtered_masks, filtered_probs, filtered_boxes)):
-                    mask_float = mask.astype(np.float32)
-                    
-                    # Ensure mask matches image dimensions (height, width)
-                    if mask_float.shape != (img_h, img_w):
-                        mask_img = Image.fromarray((mask_float * 255).astype(np.uint8))
-                        mask_img = mask_img.resize((img_w, img_h), Image.NEAREST)
-                        mask_float = (np.array(mask_img) / 255.0).astype(np.float32)
-                    
-                    mask_list.append(mask_float)
-                    
-                    # Convert box_xywh (relative coords) to pixel coords for SEG
-                    x, y, w, h = box_xywh
-                    x1 = int(x * img_w)
-                    y1 = int(y * img_h)
-                    x2 = int((x + w) * img_w)
-                    y2 = int((y + h) * img_h)
-                    
-                    # Clamp to image bounds (img_w is width, img_h is height)
-                    x1 = max(0, min(x1, img_w - 1))
-                    y1 = max(0, min(y1, img_h - 1))
-                    x2 = max(x1 + 1, min(x2, img_w))
-                    y2 = max(y1 + 1, min(y2, img_h))
-                    
-                    # crop_region and bbox are the same for this case
-                    crop_region = (x1, y1, x2, y2)
-                    bbox = (x1, y1, x2, y2)
-                    
-                    # Crop the image and mask for this segment
-                    # image_np is [H, W, C], mask_float is [H, W]
-                    cropped_image_np = image_np[y1:y2, x1:x2].astype(np.float32) / 255.0
-                    cropped_mask = mask_float[y1:y2, x1:x2].copy()
-                    
-                    # Create SEG object with object ID in label for tracking
-                    seg = SEG(
-                        cropped_image=cropped_image_np,
-                        cropped_mask=cropped_mask,
-                        confidence=float(prob),
-                        crop_region=crop_region,
-                        bbox=bbox,
-                        label=f"{prompt}_{obj_id}",
-                        control_net_wrapper=None
+            font = ImageFont.truetype("arial.ttf", 24)
+        except:
+            font = ImageFont.load_default()
+
+        last_frame_boxes = None
+        last_frame_labels = None
+        num_mega_batches = (total_frames + MEGA_BATCH_SIZE - 1) // MEGA_BATCH_SIZE
+
+        print(f"SAM3 Video: Processing {total_frames} frames in {num_mega_batches} mega-batches of {MEGA_BATCH_SIZE}")
+
+        for mega_batch_idx in range(num_mega_batches):
+            mega_start = mega_batch_idx * MEGA_BATCH_SIZE
+            mega_end = min(mega_start + MEGA_BATCH_SIZE, total_frames)
+            mega_frame_count = mega_end - mega_start
+
+            print(f"SAM3 Video: Mega-batch {mega_batch_idx + 1}/{num_mega_batches} (frames {mega_start}-{mega_end - 1})")
+
+            temp_dir = tempfile.mkdtemp()
+            inference_state = None
+
+            try:
+                for idx in range(mega_start, mega_end):
+                    local_idx = idx - mega_start
+                    image_np = (image[idx].cpu().numpy() * 255).astype(np.uint8)
+                    pil_image = Image.fromarray(image_np)
+                    pil_image.save(os.path.join(temp_dir, f"{local_idx:05d}.jpg"))
+                    del pil_image, image_np
+                    if (idx - mega_start) % FRAME_BATCH_SIZE == 0:
+                        gc.collect()
+
+                inference_state = self.model.init_state(resource_path=temp_dir)
+
+                if mega_batch_idx == 0:
+                    frame_idx, initial_output = self.model.add_prompt(
+                        inference_state=inference_state,
+                        frame_idx=0,
+                        text_str=prompt
                     )
-                    all_segs.append(seg)
-                
-                if len(mask_list) > 0:
-                    all_masks.extend(mask_list)
-                    combined_mask = np.maximum.reduce(mask_list)
-                    all_combined_masks.append(combined_mask)
+                    print(f"SAM3 Video: Initial text prompt '{prompt}' on frame 0")
                 else:
-                    all_combined_masks.append(np.zeros((pil_image.size[1], pil_image.size[0]), dtype=np.float32))
-            
-        finally:
-            # Clean up temporary directory
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-            
-            print("SAM3 Video: Cleaned up temporary files")
-            # Reset inference state to clear all accumulated state for next run
-            self.model.reset_state(inference_state)
-            print("SAM3 Video: Inference state reset")
-        
-        # Stack results
-        # Ensure float32 dtype to prevent autocast issues with downstream models (e.g., WAN video model)
-        result_tensor = torch.from_numpy(np.stack(all_result_images, axis=0)).to(dtype=torch.float32)
-        
-        if len(all_masks) > 0:
-            masks_tensor = torch.from_numpy(np.stack(all_masks, axis=0)).to(dtype=torch.float32)
+                    if last_frame_boxes is not None and len(last_frame_boxes) > 0:
+                        frame_idx, initial_output = self.model.add_prompt(
+                            inference_state=inference_state,
+                            frame_idx=0,
+                            boxes_xywh=last_frame_boxes,
+                            box_labels=last_frame_labels
+                        )
+                        print(f"SAM3 Video: Seeding with {len(last_frame_boxes)} boxes from previous batch")
+                    else:
+                        frame_idx, initial_output = self.model.add_prompt(
+                            inference_state=inference_state,
+                            frame_idx=0,
+                            text_str=prompt
+                        )
+                        print(f"SAM3 Video: No boxes from previous batch, using text prompt")
+
+                pending_outputs = {}
+
+                for local_frame_idx, outputs in self.model.propagate_in_video(
+                    inference_state=inference_state,
+                    start_frame_idx=0,
+                    max_frame_num_to_track=mega_frame_count,
+                    reverse=False
+                ):
+                    global_frame_idx = mega_start + local_frame_idx
+                    pending_outputs[global_frame_idx] = (local_frame_idx, outputs)
+
+                    if len(pending_outputs) >= FRAME_BATCH_SIZE or local_frame_idx == mega_frame_count - 1:
+                        batch_frame_indices = sorted(pending_outputs.keys())
+                        batch_images = {}
+                        for idx in batch_frame_indices:
+                            batch_images[idx] = (image[idx].cpu().numpy() * 255).astype(np.uint8)
+
+                        for idx in batch_frame_indices:
+                            local_idx, outputs = pending_outputs[idx]
+                            image_np = batch_images[idx]
+                            pil_image = Image.fromarray(image_np)
+                            img_w, img_h = pil_image.size
+
+                            if outputs is None or len(outputs.get('out_obj_ids', [])) == 0:
+                                print(f"SAM3 Video [Frame {idx + 1}/{total_frames}] no objects detected")
+                                all_result_images[idx] = torch.from_numpy(image_np.astype(np.float32) / 255.0)
+                                if local_idx == mega_frame_count - 1:
+                                    last_frame_boxes = None
+                                    last_frame_labels = None
+                                continue
+
+                            out_obj_ids = outputs['out_obj_ids']
+                            out_binary_masks = outputs['out_binary_masks']
+                            out_probs = outputs['out_probs']
+                            out_boxes_xywh = outputs['out_boxes_xywh']
+
+                            filtered_indices = []
+                            for i, (obj_id, prob, box_xywh) in enumerate(zip(out_obj_ids, out_probs, out_boxes_xywh)):
+                                if track_object_ids is not None and obj_id not in track_object_ids:
+                                    continue
+                                if prob >= threshold:
+                                    box_width = box_xywh[2]
+                                    box_height = box_xywh[3]
+                                    if box_width >= min_width_pixels and box_height >= min_height_pixels:
+                                        filtered_indices.append(i)
+
+                            filtered_obj_ids = [out_obj_ids[i] for i in filtered_indices]
+                            filtered_masks = [out_binary_masks[i] for i in filtered_indices]
+                            filtered_probs = [out_probs[i] for i in filtered_indices]
+                            filtered_boxes = [out_boxes_xywh[i] for i in filtered_indices]
+
+                            print(f"SAM3 Video [Frame {idx + 1}/{total_frames}] tracking {len(filtered_obj_ids)} object(s) with IDs {filtered_obj_ids}")
+
+                            if local_idx == mega_frame_count - 1:
+                                if filtered_boxes:
+                                    last_frame_boxes = np.array(filtered_boxes, dtype=np.float32)
+                                    last_frame_labels = np.ones(len(filtered_boxes), dtype=np.int64)
+                                else:
+                                    last_frame_boxes = None
+                                    last_frame_labels = None
+
+                            result_img_rgb = pil_image.convert('RGB')
+
+                            for obj_id, mask, prob, box_xywh in zip(filtered_obj_ids, filtered_masks, filtered_probs, filtered_boxes):
+                                mask_bool = mask.astype(bool)
+                                mask_array = np.zeros((img_h, img_w, 4), dtype=np.uint8)
+                                mask_color = colors[obj_id % len(colors)]
+                                mask_array[mask_bool] = (*mask_color, 100)
+                                mask_overlay = Image.fromarray(mask_array, 'RGBA')
+                                result_img_rgb = Image.alpha_composite(result_img_rgb.convert('RGBA'), mask_overlay).convert('RGB')
+
+                            draw = ImageDraw.Draw(result_img_rgb)
+                            for obj_id, mask, prob, box_xywh in zip(filtered_obj_ids, filtered_masks, filtered_probs, filtered_boxes):
+                                mask_color = colors[obj_id % len(colors)]
+                                x, y, w, h = box_xywh
+                                x1, y1 = int(x * img_w), int(y * img_h)
+                                x2, y2 = int((x + w) * img_w), int((y + h) * img_h)
+                                draw.rectangle([x1, y1, x2, y2], outline=mask_color, width=5)
+                                label_text = f"ID:{obj_id} {prob:.2f}"
+                                text_y = max(y1 - 35, 5)
+                                text_bbox = draw.textbbox((x1, text_y), label_text, font=font)
+                                draw.rectangle(text_bbox, fill=mask_color)
+                                draw.text((x1, text_y), label_text, fill=(255, 255, 255), font=font)
+
+                            result_np = np.array(result_img_rgb).astype(np.float32) / 255.0
+                            all_result_images[idx] = torch.from_numpy(result_np)
+                            del result_img_rgb
+
+                            frame_masks = []
+                            for obj_id, mask, prob, box_xywh in zip(filtered_obj_ids, filtered_masks, filtered_probs, filtered_boxes):
+                                mask_float = mask.astype(np.float32)
+                                if mask_float.shape != (img_h, img_w):
+                                    mask_img = Image.fromarray((mask_float * 255).astype(np.uint8))
+                                    mask_img = mask_img.resize((img_w, img_h), Image.NEAREST)
+                                    mask_float = (np.array(mask_img) / 255.0).astype(np.float32)
+
+                                frame_masks.append(mask_float)
+                                all_masks_list.append(mask_float)
+
+                                x, y, w, h = box_xywh
+                                x1 = max(0, min(int(x * img_w), img_w - 1))
+                                y1 = max(0, min(int(y * img_h), img_h - 1))
+                                x2 = max(x1 + 1, min(int((x + w) * img_w), img_w))
+                                y2 = max(y1 + 1, min(int((y + h) * img_h), img_h))
+
+                                cropped_image_np = image_np[y1:y2, x1:x2].astype(np.float32) / 255.0
+                                cropped_mask = mask_float[y1:y2, x1:x2].copy()
+
+                                seg = SEG(
+                                    cropped_image=cropped_image_np,
+                                    cropped_mask=cropped_mask,
+                                    confidence=float(prob),
+                                    crop_region=(x1, y1, x2, y2),
+                                    bbox=(x1, y1, x2, y2),
+                                    label=f"{prompt}_{obj_id}",
+                                    control_net_wrapper=None
+                                )
+                                all_segs.append(seg)
+
+                            if frame_masks:
+                                combined_mask = np.maximum.reduce(frame_masks)
+                                all_combined_masks[idx] = torch.from_numpy(combined_mask)
+
+                            del pil_image
+
+                        del batch_images
+                        pending_outputs.clear()
+                        gc.collect()
+
+            finally:
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+                if inference_state is not None:
+                    self.model.reset_state(inference_state)
+                gc.collect()
+
+            print(f"SAM3 Video: Mega-batch {mega_batch_idx + 1}/{num_mega_batches} complete")
+
+        print("SAM3 Video: All mega-batches processed")
+
+        result_tensor = all_result_images.permute(0, 1, 2, 3).contiguous()
+
+        if len(all_masks_list) > 0:
+            masks_tensor = torch.from_numpy(np.stack(all_masks_list, axis=0)).to(dtype=torch.float32)
         else:
-            masks_tensor = torch.zeros((1, image.shape[1], image.shape[2]), dtype=torch.float32)
-        
-        combined_mask_tensor = torch.from_numpy(np.stack(all_combined_masks, axis=0)).to(dtype=torch.float32)
-        
-        # Build SEGS tuple: (shape, list_of_SEG_objects)
-        # Shape is (height, width) of the original image
+            masks_tensor = torch.zeros((1, img_height, img_width), dtype=torch.float32)
+
+        combined_mask_tensor = all_combined_masks.contiguous()
         segs = ((img_height, img_width), all_segs)
-        
+
         return (result_tensor, masks_tensor, combined_mask_tensor, segs)
 
 
