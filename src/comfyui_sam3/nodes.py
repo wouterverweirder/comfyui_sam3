@@ -430,7 +430,11 @@ class SAM3Segmentation:
                 pil_img.save(os.path.join(temp_dir, f"frame_{idx:05d}.jpg"))
             
             # Initialize inference state with video frames
-            inference_state = self.model.init_state(resource_path=temp_dir)
+            inference_state = self.model.init_state(
+                resource_path=temp_dir,
+                offload_video_to_cpu=True,
+                use_streaming=True
+            )
             
             # Add text prompt on the first frame
             frame_idx, initial_output = self.model.add_prompt(

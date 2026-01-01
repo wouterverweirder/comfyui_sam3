@@ -14,7 +14,7 @@ from sam3.model.act_ckpt_utils import clone_output_wrapper
 from sam3.model.box_ops import box_xywh_to_cxcywh, box_xyxy_to_xywh
 from sam3.model.data_misc import BatchedDatapoint, convert_my_tensors, FindStage
 from sam3.model.geometry_encoders import Prompt
-from sam3.model.io_utils import IMAGE_EXTS, load_resource_as_video_frames
+from sam3.model.io_utils import IMAGE_EXTS, load_resource_as_video_frames, load_resource_as_video_frames_streaming, StreamingVideoFrameLoader
 from sam3.model.sam3_tracker_utils import fill_holes_in_mask_scores
 from sam3.model.sam3_video_base import MaskletConfirmationStatus, Sam3VideoBase
 from sam3.model.utils.misc import copy_data_to_device
@@ -57,20 +57,51 @@ class Sam3VideoInference(Sam3VideoBase):
         offload_video_to_cpu=False,
         async_loading_frames=False,
         video_loader_type="cv2",
+        use_streaming=False,
+        streaming_cache_size=8,
+        streaming_num_workers=2,
     ):
-        """Initialize an inference state from `resource_path` (an image or a video)."""
-        images, orig_height, orig_width = load_resource_as_video_frames(
-            resource_path=resource_path,
-            image_size=self.image_size,
-            offload_video_to_cpu=offload_video_to_cpu,
-            img_mean=self.image_mean,
-            img_std=self.image_std,
-            async_loading_frames=async_loading_frames,
-            video_loader_type=video_loader_type,
-        )
+        """
+        Initialize an inference state from `resource_path` (an image or a video).
+        
+        Args:
+            resource_path: Path to video file, image folder, list of PIL images, or single image
+            offload_video_to_cpu: If True, keep frames on CPU (only used when use_streaming=False)
+            async_loading_frames: If True, load frames asynchronously (only used when use_streaming=False)
+            video_loader_type: Video loader type ("cv2" or "torchcodec")
+            use_streaming: If True, use streaming frame loading to minimize VRAM usage.
+                          Frames are loaded on-demand with an LRU cache instead of 
+                          pre-loading all frames to GPU.
+            streaming_cache_size: Number of frames to keep in GPU cache when streaming (default: 8)
+            streaming_num_workers: Number of DataLoader workers for background loading (default: 2)
+        """
+        if use_streaming:
+            # Use streaming loader for reduced VRAM usage
+            images, orig_height, orig_width = load_resource_as_video_frames_streaming(
+                resource_path=resource_path,
+                image_size=self.image_size,
+                img_mean=self.image_mean,
+                img_std=self.image_std,
+                device=self.device,
+                cache_size=streaming_cache_size,
+                num_workers=streaming_num_workers,
+                video_loader_type=video_loader_type,
+            )
+        else:
+            # Original behavior: load all frames at once
+            images, orig_height, orig_width = load_resource_as_video_frames(
+                resource_path=resource_path,
+                image_size=self.image_size,
+                offload_video_to_cpu=offload_video_to_cpu,
+                img_mean=self.image_mean,
+                img_std=self.image_std,
+                async_loading_frames=async_loading_frames,
+                video_loader_type=video_loader_type,
+            )
         inference_state = {}
         inference_state["image_size"] = self.image_size
         inference_state["num_frames"] = len(images)
+        inference_state["use_streaming"] = use_streaming
         # the original video height and width, used for resizing final output scores
         inference_state["orig_height"] = orig_height
         inference_state["orig_width"] = orig_width
@@ -109,6 +140,12 @@ class Sam3VideoInference(Sam3VideoBase):
         inference_state["feature_cache"].clear()
         inference_state["cached_frame_outputs"].clear()
         inference_state["action_history"].clear()  # for logging user actions
+        
+        # Clear streaming frame cache if using streaming mode
+        if inference_state.get("use_streaming", False):
+            img_batch = inference_state["input_batch"].img_batch
+            if isinstance(img_batch, StreamingVideoFrameLoader):
+                img_batch.clear_cache()
 
     def _construct_initial_input_batch(self, inference_state, images):
         """Construct an initial `BatchedDatapoint` instance as input."""
