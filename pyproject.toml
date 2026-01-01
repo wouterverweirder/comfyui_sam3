@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "comfyui_sam3"
-version = "0.2.0"
+version = "0.2.1"
 description = "Custom Nodes to work with SAM3"
 authors = [
   {name = "Wouter Verweirder", email = "wouter.verweirder@gmail.com"}
